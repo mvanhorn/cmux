@@ -15,9 +15,176 @@ private final class StageManagerRightSidebarResponder: NSView, FeedKeyboardFocus
     override var acceptsFirstResponder: Bool { true }
 }
 
+private final class FocusOrderingWindow: NSWindow {
+    var orderingAttempts = 0
+
+    override func makeKeyAndOrderFront(_ sender: Any?) {
+        // Observe the production request without actually promoting the test window.
+        orderingAttempts += 1
+    }
+}
+
 @MainActor
 @Suite("Window activation", .serialized)
 struct GhosttyEnsureFocusWindowActivationTests {
+    @Test
+    func inactiveApplicationDoesNotRaiseHostedTerminal() async throws {
+        try await withHostedFocusTerminal { tabManager, workspace, terminal, window in
+            NSApp.deactivate()
+            try #require(!NSApp.isActive)
+            try #require(!window.isKeyWindow)
+            try #require(!terminal.hostedView.isSurfaceViewFirstResponder())
+
+            for _ in 0..<3 {
+                terminal.hostedView.ensureFocus(for: workspace.id, surfaceId: terminal.id)
+                #expect(window.orderingAttempts == 0)
+                #expect(tabManager.selectedTabId == workspace.id)
+                #expect(!terminal.hostedView.debugHasPendingAutomaticFirstResponderApplyForTesting())
+                await nextMainQueueTurn()
+            }
+
+            // Explicit application activation must still allow the same path.
+            NSApp.activate(ignoringOtherApps: true)
+            await nextMainQueueTurn()
+            try #require(NSApp.isActive)
+            NSApp.keyWindow?.resignKeyWindow()
+            try #require(window.makeFirstResponder(nil))
+            window.orderingAttempts = 0
+            terminal.hostedView.ensureFocus(for: workspace.id, surfaceId: terminal.id)
+            #expect(window.orderingAttempts == 1)
+            #expect(terminal.hostedView.isSurfaceViewFirstResponder())
+        }
+    }
+
+    @Test
+    func queuedWorkspaceReconciliationReadsCurrentApplicationActivity() async throws {
+        try await withHostedFocusTerminal { tabManager, workspace, terminal, window in
+            try #require(NSApp.isActive)
+            workspace.scheduleFocusReconcile()
+            await nextMainQueueTurn()
+            try #require(window.orderingAttempts == 1)
+            try #require(terminal.hostedView.isSurfaceViewFirstResponder())
+            try #require(window.makeFirstResponder(nil))
+            window.orderingAttempts = 0
+
+            workspace.scheduleFocusReconcile()
+            // Deactivate in the same actor turn, before the queued work runs.
+            NSApp.deactivate()
+            try #require(!NSApp.isActive)
+
+            for _ in 0..<3 {
+                await nextMainQueueTurn()
+                #expect(window.orderingAttempts == 0)
+                #expect(tabManager.selectedTabId == workspace.id)
+                #expect(!terminal.hostedView.debugHasPendingAutomaticFirstResponderApplyForTesting())
+                workspace.scheduleFocusReconcile()
+            }
+            await nextMainQueueTurn()
+            #expect(window.orderingAttempts == 0)
+            #expect(!terminal.hostedView.isSurfaceViewFirstResponder())
+        }
+    }
+
+    @Test
+    func activeReconciliationPreservesForeignFirstResponder() async throws {
+        try await withHostedFocusTerminal { _, workspace, terminal, window in
+            let contentView = try #require(window.contentView)
+            let responder = NSTextView(frame: contentView.bounds)
+            contentView.addSubview(responder)
+            try #require(window.makeFirstResponder(responder))
+
+            terminal.hostedView.ensureFocus(for: workspace.id, surfaceId: terminal.id)
+            workspace.scheduleFocusReconcile()
+            await nextMainQueueTurn()
+
+            #expect(window.firstResponder === responder)
+            #expect(window.orderingAttempts == 0)
+        }
+    }
+
+    private func nextMainQueueTurn() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
+    private func withHostedFocusTerminal(
+        _ body: @MainActor (TabManager, Workspace, TerminalPanel, FocusOrderingWindow) async throws -> Void
+    ) async throws {
+        try await AppContextSerialGate.withExclusiveAppContext {
+            let previousAppDelegate = AppDelegate.shared
+            let wasActive = NSApp.isActive
+            let previousKeyWindow = NSApp.keyWindow
+            let previousMainWindow = NSApp.mainWindow
+            let previousFrontmostApp = NSWorkspace.shared.frontmostApplication
+            let appDelegate = AppDelegate()
+            let tabManager = TabManager(autoWelcomeIfNeeded: false)
+            let window = FocusOrderingWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 360, height: 240),
+                styleMask: [.titled, .closable],
+                backing: .buffered,
+                defer: false
+            )
+            window.isReleasedWhenClosed = false
+            tabManager.window = window
+            appDelegate.tabManager = tabManager
+            AppDelegate.shared = appDelegate
+            let workspace = tabManager.addWorkspace(select: true)
+            defer {
+                workspace.setPortalRenderingEnabled(false, reason: "test.cleanup")
+                tabManager.closeWorkspace(workspace)
+                window.orderOut(nil)
+                window.close()
+                tabManager.window = nil
+                appDelegate.tabManager = nil
+                AppDelegate.shared = previousAppDelegate
+                previousMainWindow?.makeMainWindow()
+                previousKeyWindow?.makeKeyWindow()
+                if wasActive {
+                    NSApp.activate(ignoringOtherApps: true)
+                } else {
+                    NSApp.deactivate()
+                    previousFrontmostApp?.activate(options: [])
+                }
+            }
+
+            let terminal = try #require(workspace.focusedTerminalPanel)
+            let contentView = try #require(window.contentView)
+            terminal.hostedView.frame = contentView.bounds
+            terminal.hostedView.autoresizingMask = [.width, .height]
+            contentView.addSubview(terminal.hostedView)
+            window.orderBack(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            await nextMainQueueTurn()
+            NSApp.keyWindow?.resignKeyWindow()
+            window.makeMainWindow()
+            contentView.layoutSubtreeIfNeeded()
+            terminal.hostedView.layoutSubtreeIfNeeded()
+            terminal.hostedView.setVisibleInUI(true)
+            terminal.hostedView.setActive(true)
+            await nextMainQueueTurn()
+
+            try #require(NSApp.isActive)
+            try #require(NSApp.keyWindow == nil)
+            try #require(NSApp.mainWindow === window)
+            try #require(window.isVisible)
+            try #require(terminal.hostedView.debugPortalVisibleInUI)
+            try #require(terminal.hostedView.debugPortalActive)
+            try #require(workspace.isFocusedTerminalInputSurface(terminal.id))
+            try #require(window.makeFirstResponder(nil))
+            window.orderingAttempts = 0
+
+            // A positive control proves the fixture reaches the ordering branch;
+            // an early return elsewhere must fail setup, never silently pass.
+            terminal.hostedView.ensureFocus(for: workspace.id, surfaceId: terminal.id)
+            try #require(window.orderingAttempts == 1)
+            try #require(terminal.hostedView.isSurfaceViewFirstResponder())
+            try #require(window.makeFirstResponder(nil))
+            window.orderingAttempts = 0
+            try await body(tabManager, workspace, terminal, window)
+        }
+    }
+
     @Test
     func allowsActivationForActiveManager() {
         let activeManager = TabManager()
@@ -27,6 +194,7 @@ struct GhosttyEnsureFocusWindowActivationTests {
 
         #expect(
             shouldAllowEnsureFocusWindowActivation(
+                appIsActive: true,
                 activeTabManager: activeManager,
                 targetTabManager: activeManager,
                 keyWindow: targetWindow,
@@ -35,6 +203,7 @@ struct GhosttyEnsureFocusWindowActivationTests {
             )
         )
         #expect(!shouldAllowEnsureFocusWindowActivation(
+            appIsActive: true,
             activeTabManager: activeManager,
             targetTabManager: otherManager,
             keyWindow: otherWindow,
@@ -50,6 +219,7 @@ struct GhosttyEnsureFocusWindowActivationTests {
 
         #expect(
             shouldAllowEnsureFocusWindowActivation(
+                appIsActive: true,
                 activeTabManager: nil,
                 targetTabManager: targetManager,
                 keyWindow: nil,
@@ -58,6 +228,7 @@ struct GhosttyEnsureFocusWindowActivationTests {
             )
         )
         #expect(!shouldAllowEnsureFocusWindowActivation(
+            appIsActive: true,
             activeTabManager: nil,
             targetTabManager: targetManager,
             keyWindow: NSWindow(),
@@ -65,12 +236,44 @@ struct GhosttyEnsureFocusWindowActivationTests {
             targetWindow: targetWindow
         ))
         #expect(!shouldAllowEnsureFocusWindowActivation(
+            appIsActive: true,
             activeTabManager: nil,
             targetTabManager: targetManager,
             keyWindow: nil,
             mainWindow: NSWindow(),
             targetWindow: targetWindow
         ))
+    }
+
+    @Test(arguments: [false, true])
+    func activationPolicyChecksActivityBeforeManagerAndWindowIdentity(appIsActive: Bool) {
+        let targetManager = TabManager()
+        let otherManager = TabManager()
+        let targetWindow = NSWindow()
+        let otherWindow = NSWindow()
+        let cases: [(TabManager?, NSWindow?, NSWindow?, Bool)] = [
+            (targetManager, targetWindow, targetWindow, true),
+            (targetManager, nil, targetWindow, true),
+            (targetManager, nil, nil, true),
+            (nil, nil, nil, true),
+            (otherManager, nil, nil, true),
+            (otherManager, nil, targetWindow, false),
+            (otherManager, targetWindow, targetWindow, false),
+            (targetManager, otherWindow, targetWindow, false),
+            (targetManager, nil, otherWindow, false),
+            (nil, nil, targetWindow, false),
+        ]
+
+        for (activeManager, keyWindow, mainWindow, allowedWhenActive) in cases {
+            #expect(shouldAllowEnsureFocusWindowActivation(
+                appIsActive: appIsActive,
+                activeTabManager: activeManager,
+                targetTabManager: targetManager,
+                keyWindow: keyWindow,
+                mainWindow: mainWindow,
+                targetWindow: targetWindow
+            ) == (appIsActive && allowedWhenActive))
+        }
     }
 
     @Test

@@ -12030,7 +12030,10 @@ final class GhosttySurfaceScrollView: NSView {
         }
 
         if !window.isKeyWindow {
+            // Deferred pane reconciliation must not promote a background app.
+            // Read activity here, since the app may have changed since scheduling.
             guard shouldAllowEnsureFocusWindowActivation(
+                appIsActive: NSApp.isActive,
                 activeTabManager: delegate.tabManager,
                 targetTabManager: tabManager,
                 keyWindow: NSApp.keyWindow,

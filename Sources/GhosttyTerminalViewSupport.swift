@@ -83,12 +83,15 @@ extension GhosttySurfaceScrollView {
 }
 
 func shouldAllowEnsureFocusWindowActivation(
+    appIsActive: Bool,
     activeTabManager: TabManager?,
     targetTabManager: TabManager,
     keyWindow: NSWindow?,
     mainWindow: NSWindow?,
     targetWindow: NSWindow
 ) -> Bool {
+    guard appIsActive else { return false }
+
     guard activeTabManager === targetTabManager || (keyWindow == nil && mainWindow == nil) else {
         return false
     }
